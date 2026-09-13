@@ -1,4 +1,4 @@
-motor_type: dynamixel
+motor_type: feetech
 port: auto
 baudrate: 1000000
 max_current: 300
