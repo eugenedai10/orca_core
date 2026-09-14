@@ -1,5 +1,5 @@
+port: /dev/cu.usbmodem5B790775661
 motor_type: feetech
-port: auto
 baudrate: 1000000
 max_current: 300
 type: right
