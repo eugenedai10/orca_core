@@ -29,12 +29,13 @@ Two subcommands:
           tension.py/calibrate.py/init_joints() actually use -- so results
           generalize to those scripts.
 
-Examples:
+The subcommand comes first on the command line (config_path/--motor-ids/etc.
+belong to the subcommand, not the top-level parser):
 
-    uv run python scripts/probe_motor_modes.py <config.yaml> --motor-ids 3 \\
-        probe --mode current_based_position --current 150
+    uv run python scripts/probe_motor_modes.py probe <config.yaml> --motor-ids 3 \\
+        --mode current_based_position --current 150
 
-    uv run python scripts/probe_motor_modes.py <config.yaml> --motor-ids 3 stages
+    uv run python scripts/probe_motor_modes.py stages <config.yaml> --motor-ids 3
 
 Note: --mock always simulates a Dynamixel-shaped mock regardless of
 config.yaml's motor_type (every MockOrcaHand does) -- useful only as a
@@ -44,19 +45,28 @@ current behavior.
 Note: set_max_current is hand-wide in OrcaHand's own API -- it always applies
 to every motor in config.yaml, not just --motor-ids. This script surfaces
 that explicitly rather than pretending otherwise.
+
+Bench-testing a single motor before the rest of the hand is assembled? Pass
+--isolate: it trims config.yaml down to exactly --motor-ids (motor_ids,
+joint_ids, joint_to_motor_map, ROMs, calibration_sequence) before connecting,
+so connect()/get_motor_pos()/get_motor_current()/set_max_current() -- all
+hand-wide over config.motor_ids -- never try to reach a motor that isn't
+physically on the bus yet. Without --isolate, the full hand's motor_ids are
+used as configured (correct when the whole hand really is connected).
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import time
 from collections import deque
 
 import numpy as np
 
+from orca_core import MockOrcaHand, OrcaHand
 from orca_core.constants import CONTROL_MODES
-from orca_core.hardware_hand import OrcaHand
-from orca_core.utils.cli import add_hand_arguments, connect_hand, create_hand, shutdown_hand
+from orca_core.utils.cli import add_hand_arguments, connect_hand, shutdown_hand
 
 STALL_WINDOW_S = 1.0
 STALL_THRESHOLD_RAD = 0.01
@@ -179,11 +189,11 @@ def cmd_probe(hand: OrcaHand, args: argparse.Namespace) -> None:
 
 # (stage name, mode override or None to use config.control_mode, current selector)
 # current selector is a callable(config, wrist_motor_id, motor_ids) -> float | None
-def _tension_winding_current(cfg, wrist_motor_id, motor_ids):
+def _tension_winding_current(cfg, _wrist_motor_id, _motor_ids):
     return cfg.calibration_current
 
 
-def _tension_holding_current(cfg, wrist_motor_id, motor_ids):
+def _tension_holding_current(cfg, _wrist_motor_id, _motor_ids):
     return cfg.max_current
 
 
@@ -193,11 +203,11 @@ def _calibration_current(cfg, wrist_motor_id, motor_ids):
     return cfg.calibration_current
 
 
-def _no_current(cfg, wrist_motor_id, motor_ids):
+def _no_current(_cfg, _wrist_motor_id, _motor_ids):
     return None  # neutral-move: no set_max_current call at all, matches init_joints()
 
 
-def _normal_operation_current(cfg, wrist_motor_id, motor_ids):
+def _normal_operation_current(cfg, _wrist_motor_id, _motor_ids):
     return cfg.max_current
 
 
@@ -246,26 +256,99 @@ def cmd_stages(hand: OrcaHand, args: argparse.Namespace) -> None:
         print(f"{name:20s} " + ", ".join(f"motor {mid}: {v:.1f}mA" for mid, v in currents.items()))
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    add_hand_arguments(parser)
-    parser.add_argument(
+def _common_parser() -> argparse.ArgumentParser:
+    """Options shared by every subcommand: config_path/--mock (via
+    add_hand_arguments) plus --motor-ids/--rate. Added as a parent to each
+    subparser -- rather than to the top-level parser -- because a bare
+    ``nargs="?"`` positional (config_path) ahead of a subparsers action is an
+    argparse ambiguity: it can bind the wrong token to the wrong slot. With
+    subcommand-first parsing there's no ambiguity to resolve.
+    """
+    common = argparse.ArgumentParser(add_help=False)
+    add_hand_arguments(common)
+    common.add_argument(
         "--motor-ids",
         type=int,
         nargs="+",
         required=True,
         help="Motor IDs to probe. Required -- never defaults to all motors.",
     )
-    parser.add_argument(
+    common.add_argument(
         "--rate", type=float, default=10.0, help="Telemetry print rate in Hz (default 10)."
     )
+    common.add_argument(
+        "--isolate",
+        action="store_true",
+        help="Trim config.yaml down to exactly --motor-ids before connecting, so "
+        "connect()/get_motor_pos()/get_motor_current()/set_max_current() (all "
+        "hand-wide over config.motor_ids) never try to reach a motor that isn't "
+        "physically on the bus yet. Use this when bench-testing one or a few "
+        "motors before the rest of the hand is assembled.",
+    )
+    return common
 
+
+def _scope_config_to_motors(config, motor_ids: list[int]):
+    """Returns a copy of *config* trimmed to exactly *motor_ids*.
+
+    ``dataclasses.replace`` re-runs the config's own ``__post_init__``
+    validation on the result, so an inconsistent trim (e.g. a motor id with
+    no joint) fails loudly here rather than surfacing as a confusing connect()
+    error later.
+    """
+    motor_to_joint = {mid: joint for joint, mid in config.joint_to_motor_map.items()}
+    missing = [mid for mid in motor_ids if mid not in motor_to_joint]
+    if missing:
+        raise ValueError(
+            f"motor id(s) {missing} not found in config.yaml's joint_to_motor_map"
+        )
+    joint_ids = [motor_to_joint[mid] for mid in motor_ids]
+
+    return dataclasses.replace(
+        config,
+        motor_ids=list(motor_ids),
+        joint_ids=joint_ids,
+        joint_to_motor_map={j: config.joint_to_motor_map[j] for j in joint_ids},
+        joint_inversion_dict={
+            j: config.joint_inversion_dict.get(j, False) for j in joint_ids
+        },
+        joint_roms_dict={j: config.joint_roms_dict[j] for j in joint_ids},
+        neutral_position={
+            j: config.neutral_position[j] for j in joint_ids if j in config.neutral_position
+        },
+        # Not needed for probing/stage-replay (this script drives current/mode/
+        # position directly) and would otherwise reference joints we just
+        # dropped, which validate_config() rejects.
+        calibration_sequence=[],
+    )
+
+
+def _load_hand(config_path: str | None, motor_ids: list[int], *, use_mock: bool, isolate: bool):
+    hand_cls = MockOrcaHand if use_mock else OrcaHand
+    if not isolate:
+        return hand_cls(config_path=config_path)
+
+    full_config = hand_cls.config_cls.from_config_path(config_path)
+    scoped_config = _scope_config_to_motors(full_config, motor_ids)
+    print(
+        f"--isolate: connecting with only {scoped_config.joint_ids} "
+        f"(motor(s) {scoped_config.motor_ids}) instead of the full hand."
+    )
+    return hand_cls(config=scoped_config)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = _common_parser()
+
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     p_probe = sub.add_parser(
-        "probe", help="Apply one control_mode + current and stream telemetry until Ctrl+C."
+        "probe",
+        parents=[common],
+        help="Apply one control_mode + current and stream telemetry until Ctrl+C.",
     )
     p_probe.add_argument("--mode", choices=CONTROL_MODES, required=True)
     p_probe.add_argument(
@@ -280,6 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stages = sub.add_parser(
         "stages",
+        parents=[common],
         help="Guided replay of tension/calibration/neutral/normal-operation, using "
         "config.yaml's real values.",
     )
@@ -299,7 +383,9 @@ def main() -> None:
     if args.subcommand == "probe":
         args.hold = args.nudge_rad is None
 
-    hand = create_hand(args.config_path, use_mock=args.mock)
+    hand = _load_hand(
+        args.config_path, args.motor_ids, use_mock=args.mock, isolate=args.isolate
+    )
     connect_hand(hand)
     try:
         if args.subcommand == "probe":

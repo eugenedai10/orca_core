@@ -1,4 +1,4 @@
-motor_type: dynamixel
+motor_type: feetech
 port: auto
 baudrate: 1000000
 max_current: 300
@@ -129,6 +129,7 @@ neutral_position:
   pinky_pip: -2
   wrist: -20
 calibration_current: 300
+wrist_calibration_current: 300
 calibration_step_size: 0.15
 calibration_step_period: 0.0001
 calibration_num_stable: 10
@@ -200,14 +201,3 @@ calibration_sequence:
 - step: 16
   joints:
     wrist: extend
-sensors:
-  port: auto
-  # baudrate auto-detected from the connected sensor; set an explicit int
-  # only to force a specific rate.
-  # Fixed production wiring: connector N carries finger N (slot = connector - 1).
-  finger_to_sensor_id:
-    thumb: 0
-    index: 1
-    middle: 2
-    ring: 3
-    pinky: 4
